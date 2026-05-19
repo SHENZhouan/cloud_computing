@@ -85,7 +85,7 @@ else
     FAIL "Running Pod 数量: $RUNNING_COUNT > $QUOTA_PODS"
     ((Q_FAILED++)) || true
 fi
-
+# shellcheck disable=SC2126
 EXCEED_LOGS=$(grep -l "exceeded quota" "$TMPDIR"/err-*.log 2>/dev/null | wc -l)
 if [ "$EXCEED_LOGS" -gt 0 ]; then
     INFO "发现 $EXCEED_LOGS 个 Pod 因 exceeded quota 被拒绝"
@@ -200,7 +200,7 @@ else
     for i in {1..18}; do
         sleep 5
         CUR_REP=$(kubectl get hpa "$DEP_NAME" -n "$ALPHA" -o jsonpath='{.status.currentReplicas}' 2>/dev/null || echo "1")
-        POD_COUNT=$(kubectl get pods -n "$ALPHA" --no-headers 2>/dev/null | grep "^${DEP_NAME}-" | wc -l)
+        POD_COUNT=$(kubectl get pods -n "$ALPHA" --no-headers 2>/dev/null | grep -c "^${DEP_NAME}-")
         INFO "轮询 $i/18: currentReplicas=$CUR_REP, pods=$POD_COUNT"
         [ -n "$CUR_REP" ] && [ "$CUR_REP" -gt "$MAX_REPLICAS" ] && MAX_REPLICAS=$CUR_REP
         [ "$POD_COUNT" -gt "$MAX_PODS" ] && MAX_PODS=$POD_COUNT
@@ -214,8 +214,8 @@ else
         ((H_FAILED++)) || true
     fi
 
-    CRASHES=$(kubectl get pods -n "$ALPHA" --field-selector=status.phase!=Pending,status.phase!=Running --no-headers 2>/dev/null | grep "^${DEP_NAME}-" | wc -l)
-    OOM_EVENTS=$(kubectl get events -n "$ALPHA" --field-selector=reason=OOMKilled --no-headers 2>/dev/null | grep "$DEP_NAME" | wc -l)
+    CRASHES=$(kubectl get pods -n "$ALPHA" --field-selector=status.phase!=Pending,status.phase!=Running --no-headers 2>/dev/null | grep -c "^${DEP_NAME}-")
+    OOM_EVENTS=$(kubectl get events -n "$ALPHA" --field-selector=reason=OOMKilled --no-headers 2>/dev/null | grep -c "$DEP_NAME")
     STEP "Pod 稳定性检查"
     if [ "$CRASHES" -eq 0 ] && [ "$OOM_EVENTS" -eq 0 ]; then
         PASS "无 OOMKilled / CrashLoop / Evicted ($CRASHES crashes, $OOM_EVENTS OOM events)"
