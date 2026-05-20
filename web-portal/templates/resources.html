@@ -24,6 +24,167 @@
     </div>
 </div>
 
+{% set can_create_pods = identity['role'] in ['admin', 'developer'] %}
+{% set can_delete_pods = identity['role'] == 'admin' %}
+<div class="row g-4 mb-4">
+    <div class="col-xl-5">
+        <div class="card border-0 shadow-sm h-100">
+            <div class="card-header bg-primary text-white d-flex justify-content-between align-items-center">
+                <span><i class="bi bi-box-seam me-2"></i>Create Custom Pod</span>
+                <span class="badge bg-light text-primary">{{ namespace }}</span>
+            </div>
+            <div class="card-body">
+                {% if can_create_pods %}
+                <form id="custom-pod-form" novalidate onsubmit="return false;">
+                    <div class="row g-3">
+                        <div class="col-md-6">
+                            <label class="form-label">Pod Name</label>
+                            <input class="form-control" id="pod-name" placeholder="e.g. api-smoke-test" required>
+                            <div class="form-text">Lowercase DNS label.</div>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">Container Name</label>
+                            <input class="form-control" id="container-name" placeholder="default: pod name">
+                        </div>
+                        <div class="col-12">
+                            <label class="form-label">Image</label>
+                            <input class="form-control" id="pod-image" value="nginx:alpine" required>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">Container Port</label>
+                            <input class="form-control" id="pod-port" type="number" min="1" max="65535" value="80">
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">Restart Policy</label>
+                            <select class="form-select" id="restart-policy">
+                                <option value="Always">Always</option>
+                                <option value="OnFailure">OnFailure</option>
+                                <option value="Never">Never</option>
+                            </select>
+                        </div>
+                        <div class="col-12">
+                            <div class="alert alert-secondary py-2 small mb-0">
+                                <i class="bi bi-info-circle me-1"></i>
+                                Portal-created Pods tolerate single-node lab NoSchedule and PreferNoSchedule taints. If a Pod is still Pending after scheduling, the blocker is likely the runtime/network layer rather than the Pod form.
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">CPU Request</label>
+                            <input class="form-control" id="request-cpu" value="100m">
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">Memory Request</label>
+                            <input class="form-control" id="request-memory" value="128Mi">
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">CPU Limit</label>
+                            <input class="form-control" id="limit-cpu" value="400m">
+                            <div class="form-text">Must stay within the namespace CPU ratio policy.</div>
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">Memory Limit</label>
+                            <input class="form-control" id="limit-memory" value="512Mi">
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">Ephemeral Storage Request</label>
+                            <input class="form-control" id="request-ephemeral-storage" value="512Mi">
+                        </div>
+                        <div class="col-md-6">
+                            <label class="form-label">Ephemeral Storage Limit</label>
+                            <input class="form-control" id="limit-ephemeral-storage" value="1Gi">
+                        </div>
+                        <div class="col-12">
+                            <label class="form-label">Environment Variables</label>
+                            <textarea class="form-control" id="pod-env" rows="2" placeholder="KEY=value&#10;MODE=demo"></textarea>
+                            <div class="form-text">One <code>KEY=value</code> per line.</div>
+                        </div>
+                        <div class="col-12">
+                            <label class="form-label">Command / Args</label>
+                            <textarea class="form-control" id="pod-command" rows="2" placeholder="/bin/sh&#10;-c"></textarea>
+                            <textarea class="form-control mt-2" id="pod-args" rows="2" placeholder="echo hello && sleep 3600"></textarea>
+                            <div class="form-text">Optional. One list item per line; leave empty to use image defaults.</div>
+                        </div>
+                    </div>
+                    <div id="pod-create-error" class="alert alert-danger d-none mt-3"></div>
+                    <div class="d-flex gap-2 mt-3">
+                        <button class="btn btn-primary" type="button" id="btn-create-pod" onclick="createCustomPodFromButton(event)">
+                            <span class="spinner-border spinner-border-sm d-none" id="pod-create-spinner"></span>
+                            Create Pod
+                        </button>
+                        <button class="btn btn-outline-secondary" type="button" onclick="resetPodForm()">Reset</button>
+                    </div>
+                </form>
+                {% else %}
+                <div class="alert alert-info mb-0">
+                    <i class="bi bi-eye me-2"></i>
+                    {{ identity.display_role }} can monitor this namespace, but cannot create Pods from this portal page.
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    <div class="col-xl-7">
+        <div class="card border-0 shadow-sm">
+            <div class="card-header d-flex flex-wrap gap-2 justify-content-between align-items-center">
+                <span><i class="bi bi-list-check me-2"></i>Current Pods</span>
+                <button class="btn btn-sm btn-outline-primary" onclick="loadNamespacePods()">
+                    <i class="bi bi-arrow-clockwise"></i> Refresh
+                </button>
+            </div>
+            <div class="card-body">
+                <div class="alert alert-secondary py-2 small">
+                    <i class="bi bi-info-circle me-1"></i>
+                    Pod list refreshes immediately after creation. Grafana resource panels can lag about 15-30 seconds because Prometheus scrapes portal metrics every 15 seconds.
+                </div>
+                <div class="table-responsive">
+                    <table class="table table-hover align-middle" id="namespace-pods-table">
+                        <thead class="table-light">
+                            <tr>
+                                <th>Name</th>
+                                <th>Status</th>
+                                <th>Ready</th>
+                                <th>Restarts</th>
+                                <th>Age</th>
+                                <th>Requests</th>
+                                <th>Limits</th>
+                                <th class="text-end">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody></tbody>
+                    </table>
+                </div>
+                <div id="pods-loading" class="text-center text-muted py-4">
+                    <div class="spinner-border text-primary" role="status"></div>
+                    <p class="mt-2 mb-0">Loading Pods...</p>
+                </div>
+                <div id="no-pods" class="text-center text-muted py-4 d-none">
+                    <i class="bi bi-inbox fs-1"></i>
+                    <p class="mt-2 mb-0">No Pods in this namespace yet.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="row mb-4">
+    <div class="col-12">
+        <div class="card border-0 shadow-sm d-none" id="pod-diagnostics-card">
+            <div class="card-header d-flex flex-wrap gap-2 justify-content-between align-items-center">
+                <span><i class="bi bi-terminal me-2"></i>Pod Diagnostics</span>
+                <button class="btn btn-sm btn-outline-secondary" type="button" onclick="hidePodDiagnostics()">
+                    <i class="bi bi-x-lg"></i>
+                </button>
+            </div>
+            <div class="card-body">
+                <div id="pod-diagnostics-loading" class="text-muted d-none">
+                    <span class="spinner-border spinner-border-sm me-2"></span>Collecting diagnostics...
+                </div>
+                <div id="pod-diagnostics-content"></div>
+            </div>
+        </div>
+    </div>
+</div>
+
 <div class="row">
     <div class="col-12">
         <div class="card border-0 shadow-sm">
@@ -56,6 +217,10 @@
 
 {% block scripts %}
 <script>
+const NAMESPACE = {{ namespace | tojson }};
+const CAN_CREATE_PODS = {{ 'true' if can_create_pods else 'false' }};
+const CAN_DELETE_PODS = {{ 'true' if can_delete_pods else 'false' }};
+
 function toggleGrafanaFullscreen() {
     const container = document.getElementById('grafana-container');
     if (!document.fullscreenElement) {
@@ -64,5 +229,592 @@ function toggleGrafanaFullscreen() {
         document.exitFullscreen();
     }
 }
+
+function resourceSummary(values) {
+    if (!values || Object.keys(values).length === 0) return '-';
+    return Object.entries(values)
+        .map(([key, value]) => `${key}: ${value}`)
+        .join('<br>');
+}
+
+function statusBadge(status) {
+    const classes = {
+        Running: 'bg-success',
+        Pending: 'bg-warning text-dark',
+        Failed: 'bg-danger',
+        Succeeded: 'bg-info text-dark'
+    };
+    return `<span class="badge ${classes[status] || 'bg-secondary'}">${status || 'Unknown'}</span>`;
+}
+
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+}
+
+function setTextCell(row, value, className = '') {
+    const cell = document.createElement('td');
+    if (className) cell.className = className;
+    cell.textContent = value;
+    row.appendChild(cell);
+    return cell;
+}
+
+function setHtmlCell(row, html, className = '') {
+    const cell = document.createElement('td');
+    if (className) cell.className = className;
+    cell.innerHTML = html;
+    row.appendChild(cell);
+    return cell;
+}
+
+function renderPodActionCell(row, pod) {
+    const cell = document.createElement('td');
+    cell.className = 'text-end';
+    const group = document.createElement('div');
+    group.className = 'btn-group btn-group-sm';
+
+    const diagnoseButton = document.createElement('button');
+    diagnoseButton.type = 'button';
+    diagnoseButton.className = 'btn btn-outline-primary';
+    diagnoseButton.dataset.podName = pod.name;
+    diagnoseButton.title = `Diagnose ${pod.name}`;
+    diagnoseButton.innerHTML = '<i class="bi bi-terminal"></i> Diagnose';
+    diagnoseButton.addEventListener('click', () => diagnosePod(pod.name, diagnoseButton));
+    group.appendChild(diagnoseButton);
+
+    if (CAN_DELETE_PODS) {
+        const deleteButton = document.createElement('button');
+        deleteButton.type = 'button';
+        deleteButton.className = 'btn btn-outline-danger';
+        deleteButton.dataset.podName = pod.name;
+        deleteButton.title = `Delete ${pod.name}`;
+        deleteButton.innerHTML = '<i class="bi bi-trash"></i> Delete';
+        deleteButton.addEventListener('click', () => deletePod(pod.name, deleteButton));
+        group.appendChild(deleteButton);
+    }
+
+    cell.appendChild(group);
+    row.appendChild(cell);
+}
+
+function hidePodDiagnostics() {
+    document.getElementById('pod-diagnostics-card').classList.add('d-none');
+}
+
+async function loadNamespacePods() {
+    const table = document.getElementById('namespace-pods-table');
+    const tbody = table.querySelector('tbody');
+    const loading = document.getElementById('pods-loading');
+    const empty = document.getElementById('no-pods');
+
+    loading.classList.remove('d-none');
+    empty.classList.add('d-none');
+    table.classList.add('d-none');
+
+    try {
+        const data = await apiGet(`/api/namespaces/${NAMESPACE}/resources`);
+        loading.classList.add('d-none');
+        if (data.error || data.pods_error) {
+            showError(data.error || data.pods_error);
+            return [];
+        }
+        const pods = data.pods || [];
+        if (pods.length === 0) {
+            empty.classList.remove('d-none');
+            return [];
+        }
+        table.classList.remove('d-none');
+        renderNamespacePods(pods);
+        return pods;
+    } catch (e) {
+        loading.classList.add('d-none');
+        showError('Failed to load namespace Pods');
+        return [];
+    }
+}
+
+function renderNamespacePods(pods) {
+    const table = document.getElementById('namespace-pods-table');
+    const tbody = table.querySelector('tbody');
+    const empty = document.getElementById('no-pods');
+
+    if (pods.length === 0) {
+        empty.classList.remove('d-none');
+        table.classList.add('d-none');
+        return;
+    }
+
+    empty.classList.add('d-none');
+    table.classList.remove('d-none');
+    tbody.replaceChildren();
+    pods.forEach(pod => {
+        const row = document.createElement('tr');
+        const nameCell = document.createElement('td');
+        const code = document.createElement('code');
+        code.textContent = pod.name;
+        nameCell.appendChild(code);
+        row.appendChild(nameCell);
+
+        setHtmlCell(row, statusBadge(pod.status));
+        setTextCell(row, pod.ready || '-');
+        setTextCell(row, pod.restarts ?? 0);
+        setTextCell(row, pod.age || '-');
+        setHtmlCell(row, resourceSummary(pod.requests), 'small');
+        setHtmlCell(row, resourceSummary(pod.limits), 'small');
+        renderPodActionCell(row, pod);
+        tbody.appendChild(row);
+    });
+}
+
+async function waitForPodInList(podName) {
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+        const pods = await loadNamespacePods();
+        if (pods.some(pod => pod.name === podName)) {
+            return true;
+        }
+        await new Promise(resolve => setTimeout(resolve, 750));
+    }
+    return false;
+}
+
+function parseKeyValueLines(value) {
+    return value.split('\n')
+        .map(line => line.trim())
+        .filter(Boolean)
+        .map(line => {
+            const idx = line.indexOf('=');
+            if (idx === -1) return { name: line, value: '' };
+            return {
+                name: line.slice(0, idx).trim(),
+                value: line.slice(idx + 1).trim()
+            };
+        })
+        .filter(item => item.name);
+}
+
+function parseLines(value) {
+    return value.split('\n').map(line => line.trim()).filter(Boolean);
+}
+
+function cpuToMillicores(value) {
+    const raw = value.trim();
+    if (!raw) return null;
+    if (raw.endsWith('m')) return Number(raw.slice(0, -1));
+    const cores = Number(raw);
+    return Number.isFinite(cores) ? cores * 1000 : null;
+}
+
+function resetPodForm() {
+    document.getElementById('custom-pod-form').reset();
+    document.getElementById('pod-image').value = 'nginx:alpine';
+    document.getElementById('pod-port').value = '80';
+    document.getElementById('request-cpu').value = '100m';
+    document.getElementById('request-memory').value = '128Mi';
+    document.getElementById('limit-cpu').value = '400m';
+    document.getElementById('limit-memory').value = '512Mi';
+    document.getElementById('request-ephemeral-storage').value = '512Mi';
+    document.getElementById('limit-ephemeral-storage').value = '1Gi';
+    document.getElementById('pod-create-error').classList.add('d-none');
+}
+
+async function createCustomPod(event) {
+    if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+    }
+    const errorEl = document.getElementById('pod-create-error');
+    const button = document.getElementById('btn-create-pod');
+    const spinner = document.getElementById('pod-create-spinner');
+    const port = document.getElementById('pod-port').value.trim();
+
+    const payload = {
+        name: document.getElementById('pod-name').value.trim().toLowerCase(),
+        container_name: document.getElementById('container-name').value.trim().toLowerCase(),
+        image: document.getElementById('pod-image').value.trim(),
+        restart_policy: document.getElementById('restart-policy').value,
+        ports: port ? [{ container_port: port, protocol: 'TCP' }] : [],
+        resources: {
+            requests: {
+                cpu: document.getElementById('request-cpu').value.trim(),
+                memory: document.getElementById('request-memory').value.trim(),
+                'ephemeral-storage': document.getElementById('request-ephemeral-storage').value.trim()
+            },
+            limits: {
+                cpu: document.getElementById('limit-cpu').value.trim(),
+                memory: document.getElementById('limit-memory').value.trim(),
+                'ephemeral-storage': document.getElementById('limit-ephemeral-storage').value.trim()
+            }
+        },
+        env: parseKeyValueLines(document.getElementById('pod-env').value),
+        command: parseLines(document.getElementById('pod-command').value),
+        args: parseLines(document.getElementById('pod-args').value)
+    };
+
+    if (!payload.name || !payload.image) {
+        errorEl.textContent = 'Pod name and image are required.';
+        errorEl.classList.remove('d-none');
+        return;
+    }
+    const requestCpu = cpuToMillicores(payload.resources.requests.cpu);
+    const limitCpu = cpuToMillicores(payload.resources.limits.cpu);
+    if (requestCpu && limitCpu && limitCpu / requestCpu > 4) {
+        errorEl.textContent = 'Default namespace policy allows CPU limit/request ratio up to 4. Example: 100m request with 400m limit, or raise the request.';
+        errorEl.classList.remove('d-none');
+        return;
+    }
+
+    button.disabled = true;
+    spinner.classList.remove('d-none');
+    errorEl.classList.add('d-none');
+
+    try {
+        const result = await apiPost(`/api/namespaces/${NAMESPACE}/pods`, payload);
+        if (result.error) {
+            errorEl.textContent = result.error;
+            errorEl.classList.remove('d-none');
+        } else {
+            const podName = result.pod?.name || payload.name;
+            showToast(result.message || 'Pod created successfully.', 'success');
+            showToast('No extra command-line input is needed unless you want to override the image entrypoint. Use the image alone for a normal Pod.', 'info');
+            const found = await waitForPodInList(podName);
+            if (!found) {
+                showToast('Pod was accepted by Kubernetes, but it did not appear in the list yet. Refreshing again may show it.', 'info');
+            }
+        }
+    } catch (e) {
+        errorEl.textContent = e.message || 'Failed to create Pod.';
+        errorEl.classList.remove('d-none');
+    } finally {
+        button.disabled = false;
+        spinner.classList.add('d-none');
+    }
+}
+
+function createCustomPodFromButton(event) {
+    createCustomPod(event);
+    return false;
+}
+
+function diagnosticBadge(level) {
+    const classes = {
+        success: 'bg-success',
+        warning: 'bg-warning text-dark',
+        danger: 'bg-danger',
+        secondary: 'bg-secondary'
+    };
+    return classes[level] || 'bg-secondary';
+}
+
+function renderCommandBlock(commands) {
+    if (!commands || commands.length === 0) return '';
+    return `
+        <h6 class="mt-3">Commands to reproduce</h6>
+        <pre class="diagnostic-terminal mb-0">${escapeHtml(commands.join('\n'))}</pre>
+    `;
+}
+
+function renderKeyValue(items) {
+    return Object.entries(items)
+        .map(([key, value]) => `
+            <div class="col-md-3 col-sm-6">
+                <div class="diagnostic-kv">
+                    <div class="diagnostic-kv-label">${escapeHtml(key)}</div>
+                    <div class="diagnostic-kv-value">${escapeHtml(value || '-')}</div>
+                </div>
+            </div>
+        `).join('');
+}
+
+function renderSimpleList(title, items) {
+    if (!items || items.length === 0) {
+        return `<p class="text-muted small mb-0">${escapeHtml(title)}: none</p>`;
+    }
+    return `
+        <h6 class="mt-3">${escapeHtml(title)}</h6>
+        <div class="table-responsive">
+            <table class="table table-sm align-middle mb-0">
+                <thead><tr><th>Summary</th></tr></thead>
+                <tbody>
+                    ${items.map(item => `<tr><td><code>${escapeHtml(item.summary || item)}</code></td></tr>`).join('')}
+                </tbody>
+            </table>
+        </div>
+    `;
+}
+
+function renderWarningList(items) {
+    if (!items || items.length === 0) {
+        return '<p class="text-muted mb-0">No active cluster warnings detected.</p>';
+    }
+    return `
+        <ul class="mb-0 ps-3">
+            ${items.map(item => `<li>${escapeHtml(item)}</li>`).join('')}
+        </ul>
+    `;
+}
+
+function renderNodeHealth(nodes) {
+    if (!nodes || nodes.length === 0) return '<p class="text-muted mb-0">No node information available.</p>';
+    return `
+        <div class="table-responsive">
+            <table class="table table-sm align-middle mb-0">
+                <thead><tr><th>Node</th><th>Ready</th><th>Taints</th></tr></thead>
+                <tbody>
+                    ${nodes.map(node => `
+                        <tr>
+                            <td><code>${escapeHtml(node.name)}</code></td>
+                            <td>${node.ready ? '<span class="badge bg-success">Ready</span>' : '<span class="badge bg-danger">Not Ready</span>'}</td>
+                            <td class="small">${escapeHtml((node.taints || []).join(', ') || '-')}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        </div>
+    `;
+}
+
+function renderNamespaceHealth(items) {
+    if (!items || items.length === 0) return '<p class="text-muted mb-0">No system namespace information available.</p>';
+    return `
+        <div class="table-responsive">
+            <table class="table table-sm align-middle mb-0">
+                <thead><tr><th>Namespace</th><th>Status</th><th>Reason</th></tr></thead>
+                <tbody>
+                    ${items.map(item => `
+                        <tr>
+                            <td><code>${escapeHtml(item.namespace)}</code></td>
+                            <td>${item.exists ? (item.all_ready ? '<span class="badge bg-success">Ready</span>' : '<span class="badge bg-warning text-dark">Attention</span>') : '<span class="badge bg-secondary">Missing</span>'}</td>
+                            <td class="small">${escapeHtml(item.reason || '-')}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        </div>
+    `;
+}
+
+function renderConditions(conditions) {
+    if (!conditions || conditions.length === 0) return '<p class="text-muted mb-0">No conditions reported.</p>';
+    return `
+        <div class="table-responsive">
+            <table class="table table-sm align-middle mb-0">
+                <thead><tr><th>Type</th><th>Status</th><th>Reason</th><th>Message</th></tr></thead>
+                <tbody>
+                    ${conditions.map(c => `
+                        <tr>
+                            <td>${escapeHtml(c.type)}</td>
+                            <td>${escapeHtml(c.status)}</td>
+                            <td>${escapeHtml(c.reason || '-')}</td>
+                            <td class="small">${escapeHtml(c.message || '-')}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        </div>
+    `;
+}
+
+function renderRepairSteps(steps) {
+    if (!steps || steps.length === 0) {
+        return '<p class="text-muted mb-0">No repair steps are needed right now.</p>';
+    }
+    return `
+        <div class="accordion" id="repair-steps">
+            ${steps.map((step, index) => `
+                <div class="accordion-item">
+                    <h2 class="accordion-header" id="repair-step-${index}">
+                        <button class="accordion-button ${index === 0 ? '' : 'collapsed'}" type="button" data-bs-toggle="collapse" data-bs-target="#repair-step-body-${index}">
+                            ${index + 1}. ${escapeHtml(step.title)}
+                        </button>
+                    </h2>
+                    <div id="repair-step-body-${index}" class="accordion-collapse collapse ${index === 0 ? 'show' : ''}">
+                        <div class="accordion-body">
+                            <p class="mb-2 small">${escapeHtml(step.why || '')}</p>
+                            <pre class="diagnostic-terminal mb-2">${escapeHtml((step.command || []).join('\n'))}</pre>
+                            <div class="small text-muted">Expected signal: ${escapeHtml(step.expected_signal || '-')}</div>
+                        </div>
+                    </div>
+                </div>
+            `).join('')}
+        </div>
+    `;
+}
+
+function renderContainers(containers, title) {
+    if (!containers || containers.length === 0) return '';
+    return `
+        <h6 class="mt-3">${escapeHtml(title)}</h6>
+        <div class="table-responsive">
+            <table class="table table-sm align-middle mb-0">
+                <thead><tr><th>Name</th><th>Ready</th><th>State</th><th>Reason</th><th>Restarts</th><th>Message</th></tr></thead>
+                <tbody>
+                    ${containers.map(c => `
+                        <tr>
+                            <td><code>${escapeHtml(c.name)}</code></td>
+                            <td>${c.ready ? 'Yes' : 'No'}</td>
+                            <td>${escapeHtml(c.state || '-')}</td>
+                            <td>${escapeHtml(c.reason || '-')}</td>
+                            <td>${escapeHtml(c.restart_count ?? 0)}</td>
+                            <td class="small">${escapeHtml(c.message || '-')}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        </div>
+    `;
+}
+
+function renderEvents(events) {
+    if (!events || events.length === 0) return '<p class="text-muted mb-0">No events returned by Kubernetes.</p>';
+    return `
+        <div class="table-responsive">
+            <table class="table table-sm align-middle mb-0">
+                <thead><tr><th>Type</th><th>Reason</th><th>Count</th><th>Age</th><th>Message</th></tr></thead>
+                <tbody>
+                    ${events.map(e => `
+                        <tr>
+                            <td>${escapeHtml(e.type || '-')}</td>
+                            <td>${escapeHtml(e.reason || '-')}</td>
+                            <td>${escapeHtml(e.count ?? 0)}</td>
+                            <td>${escapeHtml(e.age || '-')}</td>
+                            <td class="small">${escapeHtml(e.message || '-')}</td>
+                        </tr>
+                    `).join('')}
+                </tbody>
+            </table>
+        </div>
+    `;
+}
+
+function renderPodDiagnostics(data) {
+    const pod = data.pod || {};
+    const diagnosis = data.diagnosis || {};
+    const clusterHealth = data.cluster_health || {};
+    const repairFlow = clusterHealth.repair_flow || {};
+    return `
+        <div class="alert alert-${escapeHtml(diagnosis.level || 'secondary')} mb-3">
+            <div class="d-flex flex-wrap justify-content-between gap-2">
+                <strong>${escapeHtml(diagnosis.summary || 'Diagnostics collected.')}</strong>
+                <span class="badge ${diagnosticBadge(diagnosis.level)}">${escapeHtml(pod.phase || 'Unknown')}</span>
+            </div>
+            <div class="small mt-1">${escapeHtml(diagnosis.hint || '')}</div>
+        </div>
+        <div class="row g-2 mb-3">
+            ${renderKeyValue({
+                Pod: pod.name,
+                Namespace: pod.namespace,
+                Node: pod.node,
+                'Pod IP': pod.pod_ip,
+                'Host IP': pod.host_ip,
+                QoS: pod.qos_class,
+                Age: pod.age,
+                Started: pod.start_time,
+                'Created At': pod.created_at
+            })}
+        </div>
+        <h6 class="mt-3">Tolerations</h6>
+        <p class="text-muted small mb-2">${(pod.tolerations && pod.tolerations.length) ? '' : 'No tolerations on this Pod.'}</p>
+        ${(pod.tolerations && pod.tolerations.length) ? `
+            <div class="table-responsive">
+                <table class="table table-sm align-middle mb-0">
+                    <thead><tr><th>Summary</th></tr></thead>
+                    <tbody>
+                        ${pod.tolerations.map(t => `<tr><td><code>${escapeHtml(t)}</code></td></tr>`).join('')}
+                    </tbody>
+                </table>
+            </div>
+        ` : ''}
+        ${renderSimpleList('Node Taints', data.node_taints)}
+        ${renderSimpleList('Unmatched Taints', data.unmatched_taints)}
+        ${renderCommandBlock(data.commands)}
+        <h6 class="mt-3">Conditions</h6>
+        ${renderConditions(data.conditions)}
+        ${renderContainers(data.init_containers, 'Init Containers')}
+        ${renderContainers(data.containers, 'Containers')}
+        <h6 class="mt-3">Events</h6>
+        ${renderEvents(data.events)}
+
+    `;
+}
+
+async function diagnosePod(podName, button = null) {
+    const card = document.getElementById('pod-diagnostics-card');
+    const loading = document.getElementById('pod-diagnostics-loading');
+    const content = document.getElementById('pod-diagnostics-content');
+
+    card.classList.remove('d-none');
+    loading.classList.remove('d-none');
+    content.innerHTML = '';
+    if (button) {
+        button.disabled = true;
+        button.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Diagnose';
+    }
+
+    try {
+        const result = await apiGet(`/api/namespaces/${NAMESPACE}/pods/${podName}/diagnostics`);
+        loading.classList.add('d-none');
+        if (result.error) {
+            content.innerHTML = `<div class="alert alert-danger mb-0">${escapeHtml(result.error)}</div>`;
+            return;
+        }
+        content.innerHTML = renderPodDiagnostics(result);
+    } catch (e) {
+        loading.classList.add('d-none');
+        content.innerHTML = `<div class="alert alert-danger mb-0">${escapeHtml(e.message || 'Failed to collect diagnostics.')}</div>`;
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.innerHTML = '<i class="bi bi-terminal"></i> Diagnose';
+        }
+    }
+}
+
+async function deletePod(podName, button = null) {
+    if (!CAN_DELETE_PODS) return;
+    if (!confirm(`Delete Pod ${podName} from namespace ${NAMESPACE}?`)) return;
+
+    if (button) {
+        button.disabled = true;
+        button.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Deleting';
+    }
+
+    try {
+        const result = await apiDelete(`/api/namespaces/${NAMESPACE}/pods/${podName}`);
+        if (result.error) {
+            showError(result.error);
+            return;
+        }
+        showToast(result.message || `Pod ${podName} deletion requested.`, 'success');
+        if (result.pods_error) {
+            showError(result.pods_error);
+            await loadNamespacePods();
+        } else if (Array.isArray(result.pods)) {
+            renderNamespacePods(result.pods);
+        } else {
+            await loadNamespacePods();
+        }
+    } catch (e) {
+        showError(e.message || `Failed to delete Pod ${podName}.`);
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.innerHTML = '<i class="bi bi-trash"></i> Delete';
+        }
+    }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    loadNamespacePods();
+    if (CAN_CREATE_PODS) {
+        const form = document.getElementById('custom-pod-form');
+        const button = document.getElementById('btn-create-pod');
+        form.addEventListener('submit', createCustomPod);
+    }
+});
 </script>
 {% endblock %}

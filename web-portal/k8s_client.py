@@ -4,6 +4,7 @@ import shutil
 import yaml
 import urllib.request
 import urllib.error
+import json
 from datetime import datetime, timezone
 from kubernetes import client, config
 from config import (
@@ -387,7 +388,8 @@ class K8sClient:
             'kubernetes_connected': self.is_connected(),
             'grafana': self._check_http_endpoint(f'{GRAFANA_INTERNAL_BASE_URL}/api/health'),
             'prometheus': self._check_http_endpoint(f'{PROMETHEUS_INTERNAL_BASE_URL}/-/healthy'),
-            'portal_metrics': self._check_http_endpoint(f'{PORTAL_METRICS_BASE_URL}/metrics')
+            'portal_metrics': self._check_http_endpoint(f'{PORTAL_METRICS_BASE_URL}/metrics'),
+            'warnings': []
         }
 
         metrics_usage = self.get_namespace_live_usage(namespace)
@@ -395,6 +397,21 @@ class K8sClient:
             'available': metrics_usage.get('metrics_available', False),
             'error': metrics_usage.get('metrics_error')
         }
+
+        diagnostics['node_health'] = self._cluster_node_health()
+        diagnostics['network_plugins'] = self._network_plugin_health()
+        diagnostics['system_namespaces'] = self._system_namespace_health()
+        diagnostics['recent_cluster_warnings'] = self._recent_cluster_warnings(namespace)
+        diagnostics['repair_flow'] = self._monitoring_repair_flow(diagnostics)
+
+        if not diagnostics['network_plugins'].get('ready', False):
+            diagnostics['warnings'].append('Cluster network plugin is not ready.')
+        if diagnostics['recent_cluster_warnings'].get('cni_not_initialized'):
+            diagnostics['warnings'].append('Recent events show CNI is not initialized.')
+        if diagnostics['recent_cluster_warnings'].get('projected_volume_errors'):
+            diagnostics['warnings'].append('Recent events show projected volume or kube-root-ca mount failures.')
+        if not diagnostics['node_health'].get('ready', True):
+            diagnostics['warnings'].append('At least one node is not Ready.')
 
         return diagnostics
 
@@ -566,16 +583,19 @@ class K8sClient:
                 selector=client.V1LabelSelector(match_labels=labels),
                 template=client.V1PodTemplateSpec(
                     metadata=client.V1ObjectMeta(labels=labels),
-                    spec=client.V1PodSpec(containers=[
-                        client.V1Container(
-                            name='nginx',
-                            image='nginx:alpine',
-                            ports=[client.V1ContainerPort(container_port=80)],
-                            resources=client.V1ResourceRequirements(
-                                requests={'cpu': '100m', 'memory': '128Mi'}
+                    spec=client.V1PodSpec(
+                        tolerations=self._default_workload_tolerations(),
+                        containers=[
+                            client.V1Container(
+                                name='nginx',
+                                image='nginx:alpine',
+                                ports=[client.V1ContainerPort(container_port=80)],
+                                resources=client.V1ResourceRequirements(
+                                    requests={'cpu': '100m', 'memory': '128Mi'}
+                                )
                             )
-                        )
-                    ])
+                        ]
+                    )
                 )
             )
         )
@@ -613,6 +633,65 @@ class K8sClient:
 
         return f'Demo workload {name} Deployment and Service are present.'
 
+    def create_custom_pod(self, namespace, spec, owner):
+        if not self.connected:
+            raise RuntimeError('Not connected to Kubernetes')
+
+        self._ensure_namespace_exists(namespace)
+        name = self._required_dns_label(spec.get('name'), 'Pod name')
+        image = (spec.get('image') or '').strip()
+        if not image:
+            raise ValueError('Container image is required.')
+
+        if self._pod_exists(namespace, name):
+            raise ValueError(f'Pod {name} already exists in namespace {namespace}. Choose a different name.')
+
+        container_name = self._required_dns_label(spec.get('container_name') or name, 'Container name')
+        labels = self._custom_pod_labels(spec.get('labels'), owner)
+        env = self._custom_pod_env(spec.get('env'))
+        ports = self._custom_pod_ports(spec.get('ports'))
+        resources = self._custom_pod_resources(spec.get('resources') or {})
+        command = self._string_list(spec.get('command'))
+        args = self._string_list(spec.get('args'))
+
+        container_kwargs = {
+            'name': container_name,
+            'image': image,
+            'image_pull_policy': spec.get('image_pull_policy') or 'IfNotPresent',
+            'env': env,
+            'ports': ports,
+            'resources': resources
+        }
+        if command:
+            container_kwargs['command'] = command
+        if args:
+            container_kwargs['args'] = args
+
+        pod = client.V1Pod(
+            metadata=client.V1ObjectMeta(
+                name=name,
+                namespace=namespace,
+                labels=labels,
+                annotations={
+                    'tenant.lab/created-by-role': owner or 'unknown',
+                    'tenant.lab/created-by': 'web-portal'
+                }
+            ),
+            spec=client.V1PodSpec(
+                restart_policy=spec.get('restart_policy') or 'Always',
+                tolerations=self._custom_pod_tolerations(spec.get('tolerations')),
+                containers=[client.V1Container(**container_kwargs)]
+            )
+        )
+
+        try:
+            created = self.v1.create_namespaced_pod(namespace=namespace, body=pod)
+        except client.exceptions.ApiException as e:
+            raise RuntimeError(self._format_api_exception(e))
+
+        confirmed = self._wait_for_pod(namespace, name)
+        return self._pod_summary(confirmed or created)
+
     def delete_demo_workload(self, namespace, owner):
         if not self.connected:
             raise RuntimeError('Not connected to Kubernetes')
@@ -642,6 +721,985 @@ class K8sClient:
         if not deleted:
             return f'Demo workload {name} was already absent.'
         return f"Deleted demo workload {name} {' and '.join(deleted)}."
+
+    def delete_pod(self, namespace, name):
+        if not self.connected:
+            raise RuntimeError('Not connected to Kubernetes')
+
+        self._ensure_namespace_exists(namespace)
+        name = self._required_dns_label(name, 'Pod name')
+        try:
+            self.v1.delete_namespaced_pod(
+                name=name,
+                namespace=namespace,
+                body=client.V1DeleteOptions(
+                    grace_period_seconds=0,
+                    propagation_policy='Foreground'
+                )
+            )
+        except client.exceptions.ApiException as e:
+            if e.status == 404:
+                raise ValueError(f'Pod {name} does not exist in namespace {namespace}.')
+            raise RuntimeError(self._format_api_exception(e))
+
+        deleted = self._wait_for_pod_deleted(namespace, name, attempts=30, delay_seconds=0.5)
+        if not deleted:
+            self._force_delete_pod(namespace, name)
+            deleted = self._wait_for_pod_deleted(namespace, name, attempts=20, delay_seconds=0.5)
+
+        if not deleted:
+            raise RuntimeError(f'Pod {name} is still terminating in namespace {namespace}. Check finalizers or kubelet/container runtime health.')
+        return f'Pod {name} deleted from namespace {namespace}.'
+
+    def diagnose_pod(self, namespace, name):
+        if not self.connected:
+            raise RuntimeError('Not connected to Kubernetes')
+
+        self._ensure_namespace_exists(namespace)
+        name = self._required_dns_label(name, 'Pod name')
+        try:
+            pod = self.v1.read_namespaced_pod(name=name, namespace=namespace)
+        except client.exceptions.ApiException as e:
+            if e.status == 404:
+                raise ValueError(f'Pod {name} does not exist in namespace {namespace}.')
+            raise RuntimeError(self._format_api_exception(e))
+
+        events = self._pod_events(namespace, name, pod.metadata.uid)
+        node_taints = self._schedulable_node_taints()
+        unmatched_taints = self._unmatched_taints(pod.spec.tolerations or [], node_taints)
+        cluster_health = self._pod_cluster_health(pod, events)
+        diagnosis = self._infer_pod_diagnosis(pod, events, unmatched_taints, cluster_health)
+        containers = [self._container_diagnostic(c) for c in (pod.status.container_statuses or [])]
+        init_containers = [self._container_diagnostic(c) for c in (pod.status.init_container_statuses or [])]
+
+        commands = [
+            f'kubectl get pod {name} -n {namespace} -o wide',
+            f'kubectl describe pod {name} -n {namespace}',
+            f'kubectl get events -n {namespace} --field-selector involvedObject.name={name} --sort-by=.lastTimestamp'
+        ]
+        if pod.spec.node_name:
+            commands.append(f'kubectl describe node {pod.spec.node_name}')
+        commands.extend([
+            f'kubectl get resourcequota,limitrange -n {namespace}',
+            f'kubectl logs {name} -n {namespace} --all-containers --tail=80'
+        ])
+
+        return {
+            'pod': {
+                'name': pod.metadata.name,
+                'namespace': pod.metadata.namespace,
+                'phase': pod.status.phase if pod.status else 'Unknown',
+                'node': pod.spec.node_name or '',
+                'pod_ip': pod.status.pod_ip or '',
+                'host_ip': pod.status.host_ip or '',
+                'qos_class': pod.status.qos_class or '',
+                'start_time': pod.status.start_time.isoformat() if pod.status and pod.status.start_time else '',
+                'age': self._format_age(pod.metadata.creation_timestamp),
+                'created_at': pod.metadata.creation_timestamp.isoformat() if pod.metadata.creation_timestamp else '',
+                'tolerations': [self._toleration_summary(t) for t in (pod.spec.tolerations or [])]
+            },
+            'node_taints': node_taints,
+            'unmatched_taints': unmatched_taints,
+            'cluster_health': cluster_health,
+            'diagnosis': diagnosis,
+            'conditions': [self._pod_condition_diagnostic(c) for c in (pod.status.conditions or [])],
+            'containers': containers,
+            'init_containers': init_containers,
+            'events': events,
+            'commands': commands
+        }
+
+    def _required_dns_label(self, value, label):
+        value = (value or '').strip().lower()
+        if not value:
+            raise ValueError(f'{label} is required.')
+        if len(value) > 63:
+            raise ValueError(f'{label} must be 63 characters or fewer.')
+        if not self._is_dns_label(value):
+            raise ValueError(f'{label} must use lowercase letters, numbers, and hyphens, with no leading or trailing hyphen.')
+        return value
+
+    def _is_dns_label(self, value):
+        if not value:
+            return False
+        if value[0] == '-' or value[-1] == '-':
+            return False
+        return all(c.islower() or c.isdigit() or c == '-' for c in value)
+
+    def _custom_pod_labels(self, labels, owner):
+        result = {
+            'app': 'custom-pod',
+            'tenant.lab/managed-by': 'web-portal',
+            'tenant.lab/owner-role': owner or 'unknown'
+        }
+        for item in labels or []:
+            key = (item.get('key') or '').strip()
+            value = (item.get('value') or '').strip()
+            if key and value:
+                result[key] = value
+        return result
+
+    def _custom_pod_env(self, env):
+        result = []
+        for item in env or []:
+            name = (item.get('name') or '').strip()
+            value = item.get('value')
+            if name:
+                result.append(client.V1EnvVar(name=name, value='' if value is None else str(value)))
+        return result
+
+    def _custom_pod_ports(self, ports):
+        result = []
+        for item in ports or []:
+            raw_port = item.get('container_port')
+            if raw_port in (None, ''):
+                continue
+            try:
+                port = int(raw_port)
+            except (TypeError, ValueError):
+                raise ValueError('Container ports must be numbers.')
+            if port < 1 or port > 65535:
+                raise ValueError('Container ports must be between 1 and 65535.')
+            result.append(client.V1ContainerPort(
+                name=(item.get('name') or None),
+                container_port=port,
+                protocol=item.get('protocol') or 'TCP'
+            ))
+        return result
+
+    def _custom_pod_resources(self, resources):
+        requests = self._compact_resource_map(resources.get('requests') or {})
+        limits = self._compact_resource_map(resources.get('limits') or {})
+        if not requests and not limits:
+            return None
+        return client.V1ResourceRequirements(requests=requests or None, limits=limits or None)
+
+    def _compact_resource_map(self, values):
+        allowed = {'cpu', 'memory', 'ephemeral-storage'}
+        return {
+            key: str(value).strip()
+            for key, value in values.items()
+            if key in allowed and str(value).strip()
+        }
+
+    def _string_list(self, value):
+        if not value:
+            return []
+        if isinstance(value, str):
+            return [part.strip() for part in value.splitlines() if part.strip()]
+        return [str(part).strip() for part in value if str(part).strip()]
+
+    def _default_workload_tolerations(self):
+        return [
+            client.V1Toleration(
+                operator='Exists',
+                effect='NoSchedule'
+            ),
+            client.V1Toleration(
+                operator='Exists',
+                effect='PreferNoSchedule'
+            ),
+            client.V1Toleration(
+                key='node-role.kubernetes.io/control-plane',
+                operator='Exists',
+                effect='NoSchedule'
+            ),
+            client.V1Toleration(
+                key='node-role.kubernetes.io/master',
+                operator='Exists',
+                effect='NoSchedule'
+            )
+        ]
+
+    def _custom_pod_tolerations(self, tolerations):
+        result = self._default_workload_tolerations()
+        for item in tolerations or []:
+            key = (item.get('key') or '').strip()
+            operator = (item.get('operator') or 'Exists').strip()
+            effect = (item.get('effect') or 'NoSchedule').strip()
+            value = (item.get('value') or '').strip()
+            if not key:
+                continue
+            result.append(client.V1Toleration(
+                key=key,
+                operator=operator,
+                value=value or None,
+                effect=effect or None
+            ))
+        return result
+
+    def _pod_exists(self, namespace, name):
+        try:
+            self.v1.read_namespaced_pod(name=name, namespace=namespace)
+            return True
+        except client.exceptions.ApiException as e:
+            if e.status == 404:
+                return False
+            raise RuntimeError(self._format_api_exception(e))
+
+    def _ensure_namespace_exists(self, namespace):
+        try:
+            self.v1.read_namespace(name=namespace)
+        except client.exceptions.ApiException as e:
+            if e.status == 404:
+                raise ValueError(f'Namespace {namespace} does not exist. Create or onboard the namespace first.')
+            raise RuntimeError(self._format_api_exception(e))
+
+    def _wait_for_pod(self, namespace, name, attempts=10, delay_seconds=0.5):
+        for _ in range(attempts):
+            try:
+                return self.v1.read_namespaced_pod(name=name, namespace=namespace)
+            except client.exceptions.ApiException as e:
+                if e.status != 404:
+                    raise RuntimeError(self._format_api_exception(e))
+            import time
+            time.sleep(delay_seconds)
+        return None
+
+    def _wait_for_pod_deleted(self, namespace, name, attempts=12, delay_seconds=0.5):
+        for _ in range(attempts):
+            try:
+                self.v1.read_namespaced_pod(name=name, namespace=namespace)
+            except client.exceptions.ApiException as e:
+                if e.status == 404:
+                    return True
+                raise RuntimeError(self._format_api_exception(e))
+            import time
+            time.sleep(delay_seconds)
+        return False
+
+    def _force_delete_pod(self, namespace, name):
+        try:
+            self.v1.patch_namespaced_pod(
+                name=name,
+                namespace=namespace,
+                body={'metadata': {'finalizers': []}}
+            )
+        except client.exceptions.ApiException as e:
+            if e.status != 404:
+                raise RuntimeError(self._format_api_exception(e))
+
+        try:
+            self.v1.delete_namespaced_pod(
+                name=name,
+                namespace=namespace,
+                body=client.V1DeleteOptions(
+                    grace_period_seconds=0,
+                    propagation_policy='Background'
+                )
+            )
+        except client.exceptions.ApiException as e:
+            if e.status != 404:
+                raise RuntimeError(self._format_api_exception(e))
+
+    def _pod_events(self, namespace, name, uid):
+        try:
+            events = self.v1.list_namespaced_event(
+                namespace=namespace,
+                field_selector=f'involvedObject.name={name}'
+            )
+        except client.exceptions.ApiException as e:
+            raise RuntimeError(self._format_api_exception(e))
+
+        result = []
+        for event in events.items:
+            involved = event.involved_object
+            if involved and involved.uid and uid and involved.uid != uid:
+                continue
+            result.append({
+                'type': event.type or '',
+                'reason': event.reason or '',
+                'message': event.message or '',
+                'count': event.count or 0,
+                'first_seen': self._event_time(event.first_timestamp, event.event_time),
+                'last_seen': self._event_time(event.last_timestamp, event.event_time),
+                'age': self._format_age(event.last_timestamp or event.first_timestamp or event.event_time)
+            })
+        return sorted(result, key=lambda e: e.get('last_seen') or e.get('first_seen') or '')
+
+    def _event_time(self, timestamp, event_time):
+        value = timestamp or event_time
+        return value.isoformat() if value else ''
+
+    def _pod_condition_diagnostic(self, condition):
+        return {
+            'type': condition.type or '',
+            'status': condition.status or '',
+            'reason': condition.reason or '',
+            'message': condition.message or '',
+            'last_transition_time': condition.last_transition_time.isoformat() if condition.last_transition_time else ''
+        }
+
+    def _toleration_summary(self, toleration):
+        parts = [toleration.key or '<any-key>', toleration.operator or 'Equal']
+        if toleration.value:
+            parts.append(toleration.value)
+        if toleration.effect:
+            parts.append(toleration.effect)
+        return ' | '.join(parts)
+
+    def _taint_summary(self, taint):
+        parts = [taint.key or '<any-key>']
+        if taint.value:
+            parts.append(taint.value)
+        if taint.effect:
+            parts.append(taint.effect)
+        return ' | '.join(parts)
+
+    def _schedulable_node_taints(self):
+        try:
+            nodes = self.v1.list_node()
+        except client.exceptions.ApiException as e:
+            raise RuntimeError(self._format_api_exception(e))
+
+        result = []
+        for node in nodes.items:
+            taints = node.spec.taints or []
+            for taint in taints:
+                if taint.effect in ('NoSchedule', 'PreferNoSchedule'):
+                    result.append({
+                        'node': node.metadata.name,
+                        'key': taint.key or '',
+                        'value': taint.value or '',
+                        'effect': taint.effect or '',
+                        'summary': self._taint_summary(taint)
+                    })
+        return result
+
+    def _cluster_node_health(self):
+        try:
+            nodes = self.v1.list_node()
+        except client.exceptions.ApiException as e:
+            raise RuntimeError(self._format_api_exception(e))
+
+        result = {
+            'ready': True,
+            'nodes': []
+        }
+        for node in nodes.items:
+            conditions = []
+            node_ready = True
+            for condition in node.status.conditions or []:
+                conditions.append({
+                    'type': condition.type or '',
+                    'status': condition.status or '',
+                    'reason': condition.reason or '',
+                    'message': condition.message or ''
+                })
+                if condition.type == 'Ready' and condition.status != 'True':
+                    node_ready = False
+            result['nodes'].append({
+                'name': node.metadata.name,
+                'ready': node_ready,
+                'conditions': conditions,
+                'taints': [self._taint_summary(t) for t in (node.spec.taints or [])]
+            })
+            if not node_ready:
+                result['ready'] = False
+        return result
+
+    def _network_plugin_health(self):
+        checks = [
+            ('calico-system', ['calico', 'cni']),
+            ('tigera-operator', ['tigera']),
+            ('kube-system', ['flannel', 'canal', 'cilium', 'cni'])
+        ]
+        result = {
+            'ready': False,
+            'reason': 'No known network plugin pods were found.',
+            'namespaces': []
+        }
+        found_any = False
+        not_ready = []
+
+        for namespace, keywords in checks:
+            ns_result = self._namespace_workload_health(namespace, keywords)
+            result['namespaces'].append(ns_result)
+            if ns_result.get('exists') and ns_result.get('pods'):
+                found_any = True
+            if ns_result.get('exists') and not ns_result.get('all_ready', False):
+                not_ready.append(namespace)
+
+        if found_any and not not_ready:
+            result['ready'] = True
+            result['reason'] = 'Detected network plugin pods are ready.'
+        elif found_any:
+            result['reason'] = f'Network plugin pods are not ready in: {", ".join(not_ready)}.'
+        return result
+
+    def _system_namespace_health(self):
+        namespaces = [
+            ('kube-system', []),
+            ('calico-system', []),
+            ('tigera-operator', [])
+        ]
+        return [self._namespace_workload_health(namespace, keywords) for namespace, keywords in namespaces]
+
+    def _namespace_workload_health(self, namespace, keywords):
+        try:
+            self.v1.read_namespace(namespace)
+        except client.exceptions.ApiException as e:
+            if e.status == 404:
+                return {
+                    'namespace': namespace,
+                    'exists': False,
+                    'all_ready': False,
+                    'pods': [],
+                    'reason': 'Namespace not found.'
+                }
+            raise RuntimeError(self._format_api_exception(e))
+
+        try:
+            pods = self.v1.list_namespaced_pod(namespace)
+        except client.exceptions.ApiException as e:
+            raise RuntimeError(self._format_api_exception(e))
+
+        filtered = []
+        for pod in pods.items:
+            name = pod.metadata.name or ''
+            if keywords and not any(keyword in name.lower() for keyword in keywords):
+                continue
+            filtered.append({
+                'name': name,
+                'phase': pod.status.phase if pod.status else 'Unknown',
+                'ready': self._pod_ready(pod),
+                'reason': self._pod_primary_reason(pod)
+            })
+
+        all_ready = bool(filtered) and all(p['ready'] for p in filtered)
+        reason = 'No matching pods found.' if not filtered else (
+            'All matching pods are ready.' if all_ready else 'Some matching pods are not ready.'
+        )
+        return {
+            'namespace': namespace,
+            'exists': True,
+            'all_ready': all_ready,
+            'pods': filtered,
+            'reason': reason
+        }
+
+    def _pod_ready(self, pod):
+        if not pod.status:
+            return False
+        for condition in pod.status.conditions or []:
+            if condition.type == 'Ready':
+                return condition.status == 'True'
+        return False
+
+    def _pod_primary_reason(self, pod):
+        statuses = (pod.status.container_statuses or []) + (pod.status.init_container_statuses or [])
+        for status in statuses:
+            if status.state and status.state.waiting and status.state.waiting.reason:
+                return status.state.waiting.reason
+            if status.state and status.state.terminated and status.state.terminated.reason:
+                return status.state.terminated.reason
+        return pod.status.phase if pod.status else 'Unknown'
+
+    def _recent_cluster_warnings(self, namespace):
+        result = {
+            'cni_not_initialized': False,
+            'projected_volume_errors': False,
+            'messages': []
+        }
+        namespaces = ['kube-system', namespace]
+        for target_ns in namespaces:
+            try:
+                events = self.v1.list_namespaced_event(target_ns)
+            except client.exceptions.ApiException as e:
+                if e.status == 404:
+                    continue
+                raise RuntimeError(self._format_api_exception(e))
+            for event in events.items:
+                message = (event.message or '').lower()
+                if 'cni plugin not initialized' in message:
+                    result['cni_not_initialized'] = True
+                    result['messages'].append(event.message or '')
+                if 'kube-root-ca.crt' in message or 'projected' in message or 'not registered' in message:
+                    result['projected_volume_errors'] = True
+                    result['messages'].append(event.message or '')
+        result['messages'] = result['messages'][:6]
+        return result
+
+    def _pod_cluster_health(self, pod, events):
+        node_name = pod.spec.node_name or ''
+        node_conditions = []
+        node_taints = []
+        if node_name:
+            try:
+                node = self.v1.read_node(node_name)
+                node_conditions = [self._node_condition_summary(c) for c in (node.status.conditions or [])]
+                node_taints = [self._taint_summary(t) for t in (node.spec.taints or [])]
+            except client.exceptions.ApiException as e:
+                raise RuntimeError(self._format_api_exception(e))
+
+        network_errors = []
+        mount_errors = []
+        for event in events:
+            message = (event.get('message') or '').lower()
+            reason = (event.get('reason') or '').lower()
+            if reason == 'networknotready' or 'cni plugin not initialized' in message:
+                network_errors.append(event.get('message') or '')
+            if reason == 'failedmount' and (
+                'kube-root-ca.crt' in message or 'projected' in message or 'not registered' in message
+            ):
+                mount_errors.append(event.get('message') or '')
+
+        network_plugins = self._network_plugin_health()
+        remediations = self._cluster_health_remediations(network_errors, mount_errors, network_plugins, node_conditions)
+
+        return {
+            'node_name': node_name,
+            'node_conditions': node_conditions,
+            'node_taints': node_taints,
+            'cni_ready': network_plugins.get('ready', False) and not network_errors,
+            'cni_reason': network_errors[0] if network_errors else network_plugins.get('reason', ''),
+            'network_plugins': network_plugins,
+            'kube_root_ca_mount_ok': not mount_errors,
+            'projected_volume_errors': mount_errors,
+            'remediations': remediations,
+            'repair_flow': self._pod_repair_flow(network_errors, mount_errors, network_plugins, node_conditions)
+        }
+
+    def _node_condition_summary(self, condition):
+        return {
+            'type': condition.type or '',
+            'status': condition.status or '',
+            'reason': condition.reason or '',
+            'message': condition.message or '',
+            'summary': f'{condition.type}: {condition.status}'
+        }
+
+    def _cluster_health_remediations(self, network_errors, mount_errors, network_plugins, node_conditions):
+        steps = []
+        if network_errors:
+            steps.append('Check the node CNI plugin pods in kube-system/calico-system and wait until they are Ready.')
+            steps.append('If CNI pods are crashlooping or missing, repair the cluster networking before recreating application Pods.')
+        if mount_errors:
+            steps.append('Inspect namespace ConfigMap and projected volume setup for kube-root-ca before retrying the Pod.')
+            steps.append('Verify the control-plane components finished creating namespace-scoped root CA projection resources.')
+        if any(c.get('type') == 'Ready' and c.get('status') != 'True' for c in node_conditions):
+            steps.append('Fix node readiness first; Pods will not become healthy until the assigned node reports Ready.')
+        if not network_plugins.get('ready', False):
+            steps.append('Review system namespace plugin pods from the Cluster Health section for the first not-ready component.')
+        if not steps:
+            steps.append('Cluster-side blockers were not identified automatically. Inspect the raw Events and node description.')
+        return steps
+
+    def _monitoring_repair_flow(self, diagnostics):
+        node_health = diagnostics.get('node_health') or {}
+        recent = diagnostics.get('recent_cluster_warnings') or {}
+        network_plugins = diagnostics.get('network_plugins') or {}
+        system_namespaces = diagnostics.get('system_namespaces') or []
+
+        if not node_health.get('ready', True):
+            return self._repair_flow_payload(
+                status='blocked',
+                category='node-not-ready',
+                summary='The node is Not Ready, so workloads cannot become healthy.',
+                steps=self._node_not_ready_steps(),
+                evidence=self._node_not_ready_evidence(node_health)
+            )
+        if recent.get('cni_not_initialized'):
+            return self._repair_flow_payload(
+                status='blocked',
+                category='cni-not-initialized',
+                summary='The cluster network plugin is not initialized.',
+                steps=self._cni_repair_steps(network_plugins),
+                evidence=self._cluster_warning_evidence(recent)
+            )
+        if recent.get('projected_volume_errors'):
+            return self._repair_flow_payload(
+                status='blocked',
+                category='projected-volume-registration',
+                summary='Projected volume registration is failing in the cluster control plane.',
+                steps=self._projected_volume_steps(),
+                evidence=self._cluster_warning_evidence(recent)
+            )
+        missing_or_unready = [item for item in system_namespaces if not item.get('exists') or not item.get('all_ready', False)]
+        if missing_or_unready:
+            return self._repair_flow_payload(
+                status='warning',
+                category='system-addon-not-ready',
+                summary='One or more system addon namespaces are missing or not ready.',
+                steps=self._system_addon_steps(missing_or_unready),
+                evidence=[{
+                    'kind': 'system-namespace',
+                    'summary': f'{item.get("namespace")}: {item.get("reason")}'
+                } for item in missing_or_unready]
+            )
+        return self._repair_flow_payload(
+            status='healthy',
+            category='unknown',
+            summary='No blocking cluster health issues were detected.',
+            steps=[],
+            evidence=[]
+        )
+
+    def _pod_repair_flow(self, network_errors, mount_errors, network_plugins, node_conditions):
+        if any(c.get('type') == 'Ready' and c.get('status') != 'True' for c in node_conditions):
+            return self._repair_flow_payload(
+                status='blocked',
+                category='node-not-ready',
+                summary='The assigned node is not Ready.',
+                steps=self._node_not_ready_steps(),
+                evidence=[{
+                    'kind': 'node-condition',
+                    'summary': f'{c.get("type")}: {c.get("status")} {c.get("reason") or ""}'.strip()
+                } for c in node_conditions if c.get('type') == 'Ready' and c.get('status') != 'True']
+            )
+        if network_errors:
+            return self._repair_flow_payload(
+                status='blocked',
+                category='cni-not-initialized',
+                summary='The Pod was scheduled correctly, but node networking is not initialized.',
+                steps=self._cni_repair_steps(network_plugins),
+                evidence=[{'kind': 'event', 'summary': message} for message in network_errors[:4]]
+            )
+        if mount_errors:
+            return self._repair_flow_payload(
+                status='blocked',
+                category='projected-volume-registration',
+                summary='The Pod was scheduled correctly, but projected volume registration is failing.',
+                steps=self._projected_volume_steps(),
+                evidence=[{'kind': 'event', 'summary': message} for message in mount_errors[:4]]
+            )
+        return self._repair_flow_payload(
+            status='warning',
+            category='unknown',
+            summary='Cluster runtime is not clearly blocked, but the Pod is not healthy yet.',
+            steps=self._unknown_repair_steps(),
+            evidence=[]
+        )
+
+    def _repair_flow_payload(self, status, category, summary, steps, evidence):
+        return {
+            'status': status,
+            'primary_category': category,
+            'summary': summary,
+            'steps': steps,
+            'evidence': evidence
+        }
+
+    def _node_not_ready_steps(self):
+        return [
+            self._repair_step(
+                'Check K3s service status',
+                'A NotReady node often means the K3s service is unhealthy or stopped.',
+                ['sudo systemctl status k3s'],
+                'The service should be active and recent logs should not show fatal startup errors.'
+            ),
+            self._repair_step(
+                'Restart K3s if needed',
+                'Restarting K3s can restore kubelet, container runtime, and addon reconciliation on a single-node lab host.',
+                ['sudo systemctl restart k3s'],
+                'The node should move toward Ready and system pods should begin recovering.'
+            ),
+            self._repair_step(
+                'Recheck node readiness',
+                'Confirm the control plane is publishing a healthy node status again.',
+                ['KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get nodes'],
+                'The node should report Ready.'
+            ),
+            self._repair_step(
+                'Recheck system pods',
+                'Core addons must recover before tenant Pods will start cleanly.',
+                ['KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get pods -n kube-system'],
+                'Core system pods should move to Running/Ready.'
+            )
+        ]
+
+    def _cni_repair_steps(self, network_plugins):
+        namespaces = network_plugins.get('namespaces', []) if network_plugins else []
+        focus_namespaces = [item.get('namespace') for item in namespaces if not item.get('all_ready', False) or not item.get('exists', False)]
+        namespace_hint = ', '.join(focus_namespaces) if focus_namespaces else 'kube-system, calico-system, tigera-operator'
+        return [
+            self._repair_step(
+                'Inspect network plugin pods',
+                'The CNI must be healthy before kubelet can create pod sandboxes.',
+                [
+                    'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get pods -n kube-system',
+                    'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get pods -n calico-system'
+                ],
+                f'Focus first on: {namespace_hint}. Network-related pods should be Running and Ready.'
+            ),
+            self._repair_step(
+                'Check K3s service and addon logs',
+                'Single-node K3s commonly reports CNI bootstrap failures through the K3s service logs.',
+                ['sudo systemctl status k3s'],
+                'Look for networking or addon initialization errors to clear before retrying workloads.'
+            ),
+            self._repair_step(
+                'Recheck pod events after CNI recovery',
+                'Once networking is back, the same Pod should stop reporting NetworkNotReady.',
+                ['KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get events -n kube-system --sort-by=.lastTimestamp'],
+                'New events should no longer mention CNI not initialized.'
+            )
+        ]
+
+    def _projected_volume_steps(self):
+        return [
+            self._repair_step(
+                'Inspect kube-system addon pods',
+                'Projected-volume registration errors often come from control-plane or addon reconciliation instability.',
+                ['KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get pods -n kube-system'],
+                'Core addon pods such as coredns, traefik, and control-plane-managed workloads should be healthy.'
+            ),
+            self._repair_step(
+                'Review kube-system events',
+                'The failing ConfigMap-backed or projected resources are usually named directly in recent events.',
+                ['KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get events -n kube-system --sort-by=.lastTimestamp'],
+                'Errors mentioning kube-root-ca.crt or object not registered should stop appearing.'
+            ),
+            self._repair_step(
+                'Retry tenant workloads only after registration errors stop',
+                'Recreating Pods too early will just reproduce the same mount failure.',
+                ['KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get nodes'],
+                'Once the node and kube-system are healthy, tenant Pods can be recreated safely.'
+            )
+        ]
+
+    def _system_addon_steps(self, namespaces):
+        focus = ', '.join(item.get('namespace') for item in namespaces)
+        return [
+            self._repair_step(
+                'Inspect missing or degraded addon namespaces',
+                'Tenant workloads depend on system addons being present and ready.',
+                [
+                    'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get pods -n kube-system',
+                    'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get pods -n calico-system'
+                ],
+                f'Focus on namespaces: {focus}. Restore addon readiness before re-testing tenant workloads.'
+            )
+        ]
+
+    def _unknown_repair_steps(self):
+        return [
+            self._repair_step(
+                'Inspect raw cluster and pod events',
+                'The automatic rules did not identify a primary runtime blocker.',
+                [
+                    'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get nodes',
+                    'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get events -n kube-system --sort-by=.lastTimestamp'
+                ],
+                'The next blocking signal should become obvious from current events.'
+            )
+        ]
+
+    def _repair_step(self, title, why, command, expected_signal):
+        return {
+            'title': title,
+            'why': why,
+            'command': command,
+            'expected_signal': expected_signal
+        }
+
+    def _node_not_ready_evidence(self, node_health):
+        evidence = []
+        for node in node_health.get('nodes', []):
+            if not node.get('ready', True):
+                evidence.append({
+                    'kind': 'node',
+                    'summary': f'{node.get("name")} is Not Ready'
+                })
+        return evidence
+
+    def _cluster_warning_evidence(self, recent):
+        return [{'kind': 'event', 'summary': message} for message in recent.get('messages', [])[:6]]
+
+    def _unmatched_taints(self, tolerations, node_taints):
+        unmatched = []
+        for taint in node_taints:
+            if not self._taint_is_tolerated(taint, tolerations):
+                unmatched.append(taint)
+        return unmatched
+
+    def _taint_is_tolerated(self, taint, tolerations):
+        for toleration in tolerations:
+            effect = toleration.effect or ''
+            if effect and effect != taint.get('effect'):
+                continue
+
+            operator = toleration.operator or 'Equal'
+            key = toleration.key or ''
+            value = toleration.value or ''
+
+            if operator == 'Exists':
+                if not key or key == taint.get('key'):
+                    return True
+                continue
+
+            if operator == 'Equal':
+                if key == taint.get('key') and value == (taint.get('value') or ''):
+                    return True
+        return False
+
+    def _container_diagnostic(self, status):
+        state_name, state_reason, state_message = self._container_state(status.state)
+        running = status.state.running if status.state and status.state.running else None
+        terminated = status.state.terminated if status.state and status.state.terminated else None
+        return {
+            'name': status.name,
+            'ready': bool(status.ready),
+            'restart_count': status.restart_count or 0,
+            'image': status.image or '',
+            'image_id': status.image_id or '',
+            'state': state_name,
+            'reason': state_reason,
+            'message': state_message,
+            'started_at': self._container_started_at(running, terminated),
+            'finished_at': terminated.finished_at.isoformat() if terminated and terminated.finished_at else ''
+        }
+
+    def _container_state(self, state):
+        if not state:
+            return 'Unknown', '', ''
+        if state.waiting:
+            return 'Waiting', state.waiting.reason or '', state.waiting.message or ''
+        if state.running:
+            return 'Running', '', ''
+        if state.terminated:
+            return 'Terminated', state.terminated.reason or '', state.terminated.message or ''
+        return 'Unknown', '', ''
+
+    def _container_started_at(self, running, terminated):
+        if running and running.started_at:
+            return running.started_at.isoformat()
+        if terminated and terminated.started_at:
+            return terminated.started_at.isoformat()
+        return ''
+
+    def _infer_pod_diagnosis(self, pod, events, unmatched_taints=None, cluster_health=None):
+        phase = pod.status.phase if pod.status else 'Unknown'
+        unmatched_taints = unmatched_taints or []
+        cluster_health = cluster_health or {}
+        messages = ' '.join(
+            [event.get('reason', '') + ' ' + event.get('message', '') for event in events]
+        ).lower()
+        waiting_reasons = []
+        for status in (pod.status.container_statuses or []) + (pod.status.init_container_statuses or []):
+            if status.state and status.state.waiting and status.state.waiting.reason:
+                waiting_reasons.append(status.state.waiting.reason)
+        waiting_text = ' '.join(waiting_reasons).lower()
+
+        if 'insufficient cpu' in messages or 'insufficient memory' in messages or 'insufficient ephemeral-storage' in messages:
+            return {
+                'category': 'scheduling',
+                'level': 'danger',
+                'summary': 'Pod cannot be scheduled because node resources are insufficient.',
+                'hint': 'Lower the Pod requests/limits, delete unused workloads, or add capacity to the cluster.'
+            }
+        if 'taint' in messages or "didn't tolerate" in messages:
+            if unmatched_taints:
+                summaries = ', '.join(t['summary'] for t in unmatched_taints[:3])
+                hint = (
+                    'This Pod is missing tolerations for: '
+                    f'{summaries}. Portal-created Pods now tolerate all NoSchedule/PreferNoSchedule taints in the single-node lab.'
+                )
+            else:
+                hint = (
+                    'The scheduler still reports an untolerated taint. Check the node taints section below; '
+                    'it likely comes from a custom node taint outside the original control-plane/master pair.'
+                )
+            return {
+                'category': 'scheduling',
+                'level': 'danger',
+                'summary': 'Pod is blocked by a node taint.',
+                'hint': hint
+            }
+        if 'failedscheduling' in messages or '0/' in messages and 'nodes are available' in messages:
+            return {
+                'category': 'scheduling',
+                'level': 'danger',
+                'summary': 'Kubernetes scheduler found no node that can run this Pod.',
+                'hint': 'Check the FailedScheduling event message below for the exact predicate.'
+            }
+        if (
+            self._pod_is_scheduled(pod)
+            and 'containercreating' in waiting_text
+            and ('networknotready' in messages or 'cni plugin not initialized' in messages)
+        ):
+            return {
+                'category': 'runtime-network',
+                'level': 'danger',
+                'summary': 'Pod was scheduled, but the node network plugin is not ready.',
+                'hint': cluster_health.get('cni_reason') or 'The Pod spec is valid. Repair cluster networking and then retry the workload.'
+            }
+        if 'failedmount' in messages and (
+            'kube-root-ca.crt' in messages or 'projected' in messages or 'not registered' in messages
+        ):
+            return {
+                'category': 'runtime-mount',
+                'level': 'danger',
+                'summary': 'Pod was scheduled, but projected volume setup failed for kube-root-ca.',
+                'hint': 'The Pod spec is valid. Fix the cluster-side projected volume/configmap path before retrying.'
+            }
+        if 'imagepullbackoff' in waiting_text or 'errimagepull' in waiting_text or 'failed to pull image' in messages:
+            return {
+                'category': 'image-pull',
+                'level': 'danger',
+                'summary': 'Container image cannot be pulled.',
+                'hint': 'Use a registry reachable from the K3s node, configure a registry mirror, or fix the image name/tag.'
+            }
+        if 'crashloopbackoff' in waiting_text:
+            return {
+                'category': 'app-startup',
+                'level': 'warning',
+                'summary': 'Container starts but crashes repeatedly.',
+                'hint': 'Check container logs and command/args/env configuration.'
+            }
+        if not self._pod_is_scheduled(pod) and 'failedscheduling' in messages:
+            return {
+                'category': 'scheduling',
+                'level': 'danger',
+                'summary': 'Pod is blocked before scheduling.',
+                'hint': 'Review FailedScheduling events first.'
+            }
+        if phase == 'Pending':
+            return {
+                'category': 'unknown',
+                'level': 'warning',
+                'summary': 'Pod is still Pending.',
+                'hint': 'Review Events, container waiting reasons, and Cluster Health below; this Pending Pod may already be scheduled and blocked by node runtime issues.'
+            }
+        if phase == 'Running':
+            return {
+                'category': 'unknown',
+                'level': 'success',
+                'summary': 'Pod is Running.',
+                'hint': 'If Grafana shows no usage, wait for the next metrics scrape or check metrics-server availability.'
+            }
+        return {
+            'category': 'unknown',
+            'level': 'secondary',
+            'summary': f'Pod phase is {phase}.',
+            'hint': 'Review conditions, containers, and events below for details.'
+        }
+
+    def _pod_is_scheduled(self, pod):
+        for condition in pod.status.conditions or []:
+            if condition.type == 'PodScheduled':
+                return condition.status == 'True'
+        return False
+
+    def _pod_summary(self, pod):
+        return {
+            'name': pod.metadata.name,
+            'namespace': pod.metadata.namespace,
+            'status': pod.status.phase if pod.status else 'Pending'
+        }
+
+    def _format_api_exception(self, exc):
+        message = exc.reason or 'Kubernetes API error'
+        try:
+            body = json.loads(exc.body or '{}')
+            if body.get('message'):
+                message = body['message']
+        except (TypeError, ValueError):
+            if exc.body:
+                message = exc.body
+        if exc.status:
+            return f'Kubernetes API rejected the Pod ({exc.status}): {message}'
+        return message
 
     def permission_checks(self, namespace, portal_role):
         from config import ROLE_PERMISSIONS
