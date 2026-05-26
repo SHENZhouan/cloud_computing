@@ -85,7 +85,7 @@ Isolation is enforced through **three complementary layers** (defense in depth):
 | **Network Isolation** | `NetworkPolicy` (deny ingress + scoped egress + allow intra-NS + allow DNS) | Cross-namespace pod-to-pod traffic; unauthorized inbound connections |
 | **Pod Isolation** | Namespace Pod Security labels (`baseline` enforce, `restricted` warn/audit) | Privileged pods, host networking, hostPath-style misuse |
 
-**Key Design Decision**: Kubernetes RBAC is additive and has no explicit deny rule. This platform therefore follows least privilege: sensitive resources such as `secrets`, `roles`, `rolebindings`, `resourcequotas`, `limitranges`, and `networkpolicies` are simply not granted to developer/viewer roles. User ServiceAccounts are stored outside tenant namespaces, so a developer cannot create a pod that mounts the tenant-admin token.
+**Key Design Decision**: Kubernetes RBAC is additive and has no explicit deny rule. This platform therefore follows least privilege: `secrets`, `roles`, `rolebindings`, and `networkpolicies` are not granted to developer/viewer roles. `resourcequotas` and `limitranges` are granted read-only access to developers and viewers so they can inspect capacity and defaults, but write access is reserved for cluster and tenant admins. User ServiceAccounts are stored outside tenant namespaces, so a developer cannot create a pod that mounts the tenant-admin token.
 
 ### 3. RBAC Design
 
@@ -216,8 +216,24 @@ cp .env.example .env
 ### Install K3s On Ubuntu
 
 ```bash
-curl -sfL https://get.k3s.io | sh -
+curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --flannel-backend=vxlan" sh -
 sudo chmod 644 /etc/rancher/k3s/k3s.yaml
+```
+
+Important: do not install K3s with `--flannel-backend none` unless you will also install and maintain a separate CNI plugin. This project assumes the default K3s network is available.
+
+If a node stays `NotReady` with `NetworkPluginNotReady` and `cni plugin not initialized`, inspect the host config sources:
+
+```bash
+cat /etc/rancher/k3s/config.yaml
+cat /etc/systemd/system/k3s.service.env
+systemctl cat k3s
+```
+
+If any of them contain `flannel-backend: none` or `--flannel-backend none`, apply the project fix:
+
+```bash
+sudo ./scripts/fix-k3s-flannel.sh
 ```
 
 ### Verify Host Setup
@@ -235,8 +251,8 @@ KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get nodes
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/oukunhei/Kubernetes_Lab_Platform.git
-cd Kubernetes_Lab_Platform
+git clone https://github.com/SHENZhouan/cloud_computing.git
+cd cloud_computing
 ```
 
 ### 2. Start the Web Portal
@@ -421,7 +437,7 @@ kubectl run test-client --image=busybox -it --rm --restart=Never --namespace tea
 | **Dashboard** | Cluster overview: nodes, namespaces, pods, tenant count |
 | **Tenant Management** | One-click create/delete tenants with full isolation stack |
 | **Resource Monitoring** | Per-namespace ResourceQuota usage bars, LimitRange rules, Pod list |
-| **Role Action Lab** | Browser buttons to create/delete a demo workload and run live RBAC permission checks |
+| **Role Action Lab** | Browser buttons to create/delete a demo workload (with auto-scaling HPA) and run live RBAC permission checks |
 | **Resource Settings** | Admin can update tenant ResourceQuota/LimitRange from the browser; developer/viewer get read-only access |
 | **Kubeconfig Generator** | Web UI to download role-appropriate admin/dev/view kubeconfig files |
 | **Permissions Viewer** | Visual matrix showing what each role can/cannot do |
@@ -439,7 +455,7 @@ Use this flow to demonstrate resource and permission differences directly in the
 3. Open **Resources** for `team-alpha`.
 4. In **Role Action Lab**, click **Create Admin Demo**. A `lab-demo-admin` Deployment and Service are created, and the Pod list refreshes.
 5. Click **Run Permission Checks**. The page runs `kubectl auth can-i --as=system:serviceaccount:lab-platform-users:team-alpha-admin ...` and shows which actions are allowed or denied.
-6. Log out, log in as `developer`, and open the same namespace. The developer can create/delete its own `lab-demo-developer` workload while `lab-demo-admin` remains separate; permission checks show denial for `secrets`, `resourcequotas`, and RBAC modification.
+6. Log out, log in as `developer`, and open the same namespace. The developer can create/delete its own `lab-demo-developer` workload while `lab-demo-admin` remains separate; permission checks show denial for `secrets` and RBAC modification.
 7. Log out, log in as `viewer`, and open the same namespace. The viewer can inspect resources and run permission checks, while create/delete workload buttons are disabled.
 
 This browser flow shows both platform UX controls and live Kubernetes RBAC checks.
@@ -453,9 +469,12 @@ export KUBECONFIG=./team-alpha-dev-kubeconfig
 kubectl get pods
 kubectl create deployment nginx --image=nginx
 
+# Should SUCCEED
+kubectl get resourcequota
+kubectl get limitranges
+
 # Should FAIL (forbidden)
 kubectl get secrets
-kubectl get resourcequota
 kubectl get networkpolicy
 kubectl get roles
 ```
@@ -503,6 +522,22 @@ kubectl apply -f demo/test-pod.yaml
 kubectl describe pod no-resources-pod | grep -A5 "Requests"
 # Should show: cpu=200m, memory=256Mi (defaults)
 ```
+
+### 5. Verify HPA Auto-Scaling
+
+Create a demo workload from the portal (or manually apply a Deployment with `resources.requests`), then watch HPA scale the pods:
+
+```bash
+export KUBECONFIG=./team-alpha-dev-kubeconfig
+
+# Check HPA status
+kubectl get hpa -n team-alpha
+
+# Watch pod count change over time
+kubectl get pods -n team-alpha -w
+```
+
+In the Grafana dashboard, open the **Pod Count Over Time** panel to see the replica count rise and fall as CPU load changes.
 
 ---
 
